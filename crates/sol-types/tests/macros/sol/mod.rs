@@ -1421,3 +1421,186 @@ fn error_and_event_builders() {
     let manual = IExampleEvents::EventWithString(EventWithString { label: hash, value: amount });
     assert_eq!(built, manual);
 }
+
+#[test]
+fn precompile_dispatch_macro() {
+    // Callback macro that stringifies the dispatch tokens for assertion.
+    macro_rules! test_callback {
+        (view, returns, $method:ident, ($($args:ident),*),) => {
+            concat!("view returns ", stringify!($method) $(, " ", stringify!($args))*)
+        };
+        (nonpayable, returns, $method:ident, ($($args:ident),*),) => {
+            concat!("nonpayable returns ", stringify!($method) $(, " ", stringify!($args))*)
+        };
+        (nonpayable, void, $method:ident, ($($args:ident),*),) => {
+            concat!("nonpayable void ", stringify!($method) $(, " ", stringify!($args))*)
+        };
+        (nonpayable, void, $method:ident, ($($args:ident),*), hardfork($hf:literal),) => {
+            concat!("nonpayable void ", stringify!($method) $(, " ", stringify!($args))*, " hardfork:", $hf)
+        };
+        (payable, void, $method:ident, ($($args:ident),*),) => {
+            concat!("payable void ", stringify!($method) $(, " ", stringify!($args))*)
+        };
+        (pure, returns, $method:ident, ($($args:ident),*),) => {
+            concat!("pure returns ", stringify!($method) $(, " ", stringify!($args))*)
+        };
+    }
+
+    sol! {
+        #[sol(precompile)]
+        interface IPrecompile {
+            function getName() external view returns (string memory);
+            function balanceOf(address account) external view returns (uint256);
+            function transfer(address to, uint256 amount) external returns (bool);
+            function mint(address to, uint256 amount) external;
+            #[sol(hardfork = "T2")]
+            function newFeature(uint256 x) external;
+            function deposit() external payable;
+            function compute(uint256 x) external pure returns (uint256);
+        }
+    }
+
+    // No `use IPrecompile::*` — fully-qualified paths work without imports.
+    let dispatch_fn = __IPrecompile_precompile_dispatch!(test_callback,);
+
+    // view, no params, unit struct
+    let r = dispatch_fn(IPrecompile::IPrecompileCalls::getName(IPrecompile::getNameCall {}));
+    assert_eq!(r, "view returns get_name");
+
+    // view, named param
+    let r = dispatch_fn(IPrecompile::IPrecompileCalls::balanceOf(
+        IPrecompile::balanceOfCall { account: Address::ZERO },
+    ));
+    assert_eq!(r, "view returns balance_of account");
+
+    // nonpayable + returns
+    let r = dispatch_fn(IPrecompile::IPrecompileCalls::transfer(
+        IPrecompile::transferCall { to: Address::ZERO, amount: U256::ZERO },
+    ));
+    assert_eq!(r, "nonpayable returns transfer to amount");
+
+    // nonpayable + void
+    let r = dispatch_fn(IPrecompile::IPrecompileCalls::mint(
+        IPrecompile::mintCall { to: Address::ZERO, amount: U256::ZERO },
+    ));
+    assert_eq!(r, "nonpayable void mint to amount");
+
+    // nonpayable + hardfork + void
+    let r = dispatch_fn(IPrecompile::IPrecompileCalls::newFeature(
+        IPrecompile::newFeatureCall { x: U256::ZERO },
+    ));
+    assert_eq!(r, "nonpayable void new_feature x hardfork:T2");
+
+    // payable + void
+    let r = dispatch_fn(IPrecompile::IPrecompileCalls::deposit(IPrecompile::depositCall {}));
+    assert_eq!(r, "payable void deposit");
+
+    // pure + returns
+    let r = dispatch_fn(IPrecompile::IPrecompileCalls::compute(
+        IPrecompile::computeCall { x: U256::ZERO },
+    ));
+    assert_eq!(r, "pure returns compute x");
+}
+
+#[test]
+fn precompile_dispatch_tuple_struct() {
+    macro_rules! test_callback {
+        (nonpayable, returns, $method:ident, ($($args:ident),*),) => {
+            concat!("nonpayable returns ", stringify!($method) $(, " ", stringify!($args))*)
+        };
+        (nonpayable, void, $method:ident, ($($args:ident),*),) => {
+            concat!("nonpayable void ", stringify!($method) $(, " ", stringify!($args))*)
+        };
+    }
+
+    sol! {
+        #[sol(precompile)]
+        interface ITupleStruct {
+            // Single unnamed param → tuple struct destructuring
+            function process(uint256) external returns (bool);
+            // Two unnamed params → named fields with _0, _1
+            function combine(uint256, address) external;
+        }
+    }
+
+    let dispatch_fn = __ITupleStruct_precompile_dispatch!(test_callback,);
+
+    // Single unnamed param: tuple struct FooCall(_0)
+    let r = dispatch_fn(ITupleStruct::ITupleStructCalls::process(
+        ITupleStruct::processCall(U256::from(42)),
+    ));
+    assert_eq!(r, "nonpayable returns process _0");
+
+    // Two unnamed params: named fields _0, _1
+    let r = dispatch_fn(ITupleStruct::ITupleStructCalls::combine(
+        ITupleStruct::combineCall { _0: U256::from(1), _1: Address::ZERO },
+    ));
+    assert_eq!(r, "nonpayable void combine _0 _1");
+}
+
+#[test]
+fn precompile_dispatch_overloads() {
+    macro_rules! test_callback {
+        (nonpayable, returns, $method:ident, ($($args:ident),*),) => {
+            concat!("nonpayable returns ", stringify!($method) $(, " ", stringify!($args))*)
+        };
+    }
+
+    sol! {
+        #[sol(precompile)]
+        interface IOverloaded {
+            function transfer(address to, uint256 amount) external returns (bool);
+            function transfer(address from, address to, uint256 amount) external returns (bool);
+        }
+    }
+
+    let dispatch_fn = __IOverloaded_precompile_dispatch!(test_callback,);
+
+    // Overloaded names get disambiguated to transfer_0 / transfer_1
+    let r = dispatch_fn(IOverloaded::IOverloadedCalls::transfer_0(
+        IOverloaded::transfer_0Call { to: Address::ZERO, amount: U256::ZERO },
+    ));
+    assert_eq!(r, "nonpayable returns transfer_0 to amount");
+
+    let r = dispatch_fn(IOverloaded::IOverloadedCalls::transfer_1(
+        IOverloaded::transfer_1Call { from: Address::ZERO, to: Address::ZERO, amount: U256::ZERO },
+    ));
+    assert_eq!(r, "nonpayable returns transfer_1 from to amount");
+}
+
+#[test]
+fn precompile_dispatch_hardfork_inheritance() {
+    macro_rules! test_callback {
+        (view, returns, $method:ident, ($($args:ident),*), hardfork($hf:literal),) => {
+            concat!("view returns ", stringify!($method) $(, " ", stringify!($args))*, " hardfork:", $hf)
+        };
+        (nonpayable, void, $method:ident, ($($args:ident),*), hardfork($hf:literal),) => {
+            concat!("nonpayable void ", stringify!($method) $(, " ", stringify!($args))*, " hardfork:", $hf)
+        };
+    }
+
+    sol! {
+        // Interface-level default hardfork applies to all functions.
+        #[sol(precompile, hardfork = "T2")]
+        interface IHardforkDefault {
+            function getName() external view returns (string memory);
+            // Per-function override takes precedence.
+            #[sol(hardfork = "T3")]
+            function upgrade(uint256 x) external;
+        }
+    }
+
+    let dispatch_fn = __IHardforkDefault_precompile_dispatch!(test_callback,);
+
+    // Inherits interface-level default "T2"
+    let r = dispatch_fn(IHardforkDefault::IHardforkDefaultCalls::getName(
+        IHardforkDefault::getNameCall {},
+    ));
+    assert_eq!(r, "view returns get_name hardfork:T2");
+
+    // Per-function override to "T3"
+    let r = dispatch_fn(IHardforkDefault::IHardforkDefaultCalls::upgrade(
+        IHardforkDefault::upgradeCall { x: U256::ZERO },
+    ));
+    assert_eq!(r, "nonpayable void upgrade x hardfork:T3");
+}

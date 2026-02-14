@@ -114,6 +114,17 @@ pub struct SolAttrs {
     /// Ignore unlinked bytecode
     /// `#[sol(ignore_unlinked)]`
     pub ignore_unlinked: Option<bool>,
+
+    /// `#[sol(precompile)]`
+    ///
+    /// When set on an interface, generates a `macro_rules!` dispatch macro that routes
+    /// decoded calls to a consumer-provided callback macro.
+    pub precompile: Option<bool>,
+    /// `#[sol(hardfork = "NAME")]`
+    ///
+    /// Function-level attribute; may also be set at the interface level as a default
+    /// for all contained functions.
+    pub hardfork: Option<LitStr>,
 }
 
 impl SolAttrs {
@@ -206,6 +217,9 @@ impl SolAttrs {
 
                     type_check => lit()?,
                     ignore_unlinked => bool()?,
+
+                    precompile => bool()?,
+                    hardfork => lit()?,
                 };
                 Ok(())
             })?;
@@ -242,6 +256,8 @@ impl SolAttrs {
         merge_opt(&mut a.deployed_bytecode, &b.deployed_bytecode);
         merge_opt(&mut a.type_check, &b.type_check);
         merge_opt(&mut a.ignore_unlinked, &b.ignore_unlinked);
+        merge_opt(&mut a.precompile, &b.precompile);
+        merge_opt(&mut a.hardfork, &b.hardfork);
     }
 }
 
@@ -509,6 +525,17 @@ mod tests {
             #[sol(ignore_unlinked)] => Ok(sol_attrs! { ignore_unlinked: true }),
             #[sol(ignore_unlinked = true)] => Ok(sol_attrs! { ignore_unlinked: true }),
             #[sol(ignore_unlinked = false)] => Ok(sol_attrs! { ignore_unlinked: false }),
+        }
+
+        precompile {
+            #[sol(precompile)] => Ok(sol_attrs! { precompile: true }),
+            #[sol(precompile = true)] => Ok(sol_attrs! { precompile: true }),
+            #[sol(precompile = false)] => Ok(sol_attrs! { precompile: false }),
+        }
+
+        hardfork {
+            #[sol(hardfork = "T2")] => Ok(sol_attrs! { hardfork: parse_quote!("T2") }),
+            #[sol(hardfork = "T2")] #[sol(hardfork = "T3")] => Err(DUPLICATE_ERROR),
         }
     }
 }

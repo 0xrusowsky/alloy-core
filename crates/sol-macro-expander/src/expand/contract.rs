@@ -7,7 +7,7 @@ use ast::{Item, ItemContract, ItemError, ItemEvent, ItemFunction, SolIdent, Span
 use heck::ToSnakeCase;
 use proc_macro2::{Ident, TokenStream};
 use quote::{format_ident, quote};
-use syn::{Attribute, Result, parse_quote};
+use syn::{Attribute, LitStr, Result, parse_quote};
 
 /// Expands an [`ItemContract`]:
 ///
@@ -37,6 +37,7 @@ pub(super) fn expand(cx: &mut ExpCtxt<'_>, contract: &ItemContract) -> Result<To
     let rpc = sol_attrs.rpc.or(cx.attrs.rpc).unwrap_or(false);
     let abi = sol_attrs.abi.or(cx.attrs.abi).unwrap_or(false);
     let docs = sol_attrs.docs.or(cx.attrs.docs).unwrap_or(true);
+    let precompile = sol_attrs.precompile.or(cx.attrs.precompile).unwrap_or(false);
 
     let bytecode = sol_attrs.bytecode.as_ref().map(|lit| {
         let name = Ident::new("BYTECODE", lit.span());
@@ -505,6 +506,12 @@ pub(super) fn expand(cx: &mut ExpCtxt<'_>, contract: &ItemContract) -> Result<To
         }
     });
 
+    let precompile_dispatch = if precompile && !functions.is_empty() {
+        Some(generate_precompile_dispatch(name, &functions, sol_attrs.hardfork.as_ref(), cx)?)
+    } else {
+        None
+    };
+
     let alloy_sol_types = &cx.crates.sol_types;
 
     let tokens = quote! {
@@ -529,6 +536,8 @@ pub(super) fn expand(cx: &mut ExpCtxt<'_>, contract: &ItemContract) -> Result<To
 
             #rpc
         }
+
+        #precompile_dispatch
     };
     Ok(tokens)
 }
@@ -1265,7 +1274,7 @@ fn generate_abi_manifest(
         };
 
         let param_count = f.parameters.len();
-        let has_return = f.returns.as_ref().is_some_and(|r| !r.returns.is_empty());
+        let has_return = function_has_return(f);
 
         quote! {
             #alloy_sol_types::MethodSpec {
@@ -1287,6 +1296,111 @@ fn generate_abi_manifest(
             #(#entries),*
         ];
     }
+}
+
+/// Generates a `macro_rules!` dispatch macro for precompile interfaces.
+///
+/// When `#[sol(precompile)]` is present on an interface, this generates a macro that routes
+/// decoded `{Interface}Calls` variants to `$callback!` invocations via a consumer-provided
+/// callback macro.
+fn generate_precompile_dispatch(
+    contract_name: &SolIdent,
+    functions: &[ItemFunction],
+    default_hardfork: Option<&LitStr>,
+    cx: &ExpCtxt<'_>,
+) -> Result<TokenStream> {
+    let calls_name = format_ident!("{contract_name}Calls");
+    let macro_name = format_ident!("__{contract_name}_precompile_dispatch");
+
+    let mut arms = Vec::with_capacity(functions.len());
+    for f in functions {
+        if f.name.is_none() {
+            continue;
+        }
+
+        let overloaded = cx.function_name(f);
+        let call_struct_name = cx.call_name(f);
+        let rust_method = format_ident!("{}", snakify(&overloaded.as_string()));
+
+        let (fn_attrs, _) = f.split_attrs()?;
+        let hardfork_value =
+            fn_attrs.hardfork.as_ref().or(default_hardfork).map(|lit| lit.value());
+
+        let mutability_token = match f.attributes.mutability() {
+            Some(ast::Mutability::Pure(_) | ast::Mutability::Constant(_)) => quote!(pure),
+            Some(ast::Mutability::View(_)) => quote!(view),
+            Some(ast::Mutability::Payable(_)) => quote!(payable),
+            None => quote!(nonpayable),
+        };
+
+        let return_token = if function_has_return(f) { quote!(returns) } else { quote!(void) };
+
+        let field_names: Vec<_> = f
+            .parameters
+            .iter()
+            .enumerate()
+            .map(|(i, p)| anon_name((i, p.name.as_ref())))
+            .collect();
+
+        let destructure = if f.parameters.is_empty() {
+            quote! { #contract_name::#call_struct_name {} }
+        } else if f.parameters.len() == 1 && f.parameters[0].name.is_none() {
+            let name = &field_names[0];
+            quote! { #contract_name::#call_struct_name(#name) }
+        } else {
+            quote! { #contract_name::#call_struct_name { #(#field_names),* } }
+        };
+
+        let args = quote!( (#(#field_names),*) );
+
+        let callback_invocation = if let Some(hf) = &hardfork_value {
+            quote! {
+                $callback!(#mutability_token, #return_token, #rust_method, #args, hardfork(#hf), $($ctx)*)
+            }
+        } else {
+            quote! {
+                $callback!(#mutability_token, #return_token, #rust_method, #args, $($ctx)*)
+            }
+        };
+
+        let variant_name = &overloaded.0;
+
+        arms.push(quote! {
+            #contract_name::#calls_name::#variant_name(#destructure) => {
+                #callback_invocation
+            }
+        });
+    }
+
+    let doc = format!(
+        "Auto-generated precompile dispatch macro for [`{contract_name}`]({contract_name}).\n\
+         \n\
+         Routes decoded [`{calls_name}`]({contract_name}::{calls_name}) variants to `$callback!` invocations.\n\
+         Each arm invokes `$callback!` with:\n\
+         - state mutability token: `view`, `pure`, `nonpayable`, or `payable`\n\
+         - return kind: `returns` or `void`\n\
+         - method name (snake_case ident)\n\
+         - args tuple (destructured fields from the SolCall struct)\n\
+         - optional flags: `hardfork(\"NAME\")`\n\
+         - pass-through context tokens `$($ctx)*`"
+    );
+
+    Ok(quote! {
+        #[doc = #doc]
+        #[doc(hidden)]
+        macro_rules! #macro_name {
+            ($callback:path, $($ctx:tt)*) => {
+                |call: #contract_name::#calls_name| match call {
+                    #(#arms)*
+                }
+            };
+        }
+    })
+}
+
+/// Returns `true` if the function has a non-empty `returns (...)` clause.
+fn function_has_return(f: &ItemFunction) -> bool {
+    f.returns.as_ref().is_some_and(|r| !r.returns.is_empty())
 }
 
 /// `heck` doesn't treat numbers as new words, and discards leading underscores.
