@@ -597,3 +597,86 @@ fn special_funcs() {
         Some(Receive { state_mutability: StateMutability::Payable })
     );
 }
+
+#[test]
+fn abi_manifest() {
+    use alloy_sol_types::StateMutability as SM;
+
+    sol! {
+        #[sol(abi)]
+        interface IManifest {
+            function getNonce(address account, uint256 nonceKey) external view returns (uint64);
+            function transfer(address to, uint256 amount) external returns (bool);
+            function pause() external;
+            function deposit() external payable;
+            function compute(uint256 x) external pure returns (uint256);
+        }
+    }
+
+    let manifest = IManifest::ABI_MANIFEST;
+    assert_eq!(manifest.len(), 5);
+
+    let get_nonce = &manifest[0];
+    assert_eq!(get_nonce.name, "getNonce");
+    assert_eq!(get_nonce.rust_name, "get_nonce");
+    assert_eq!(get_nonce.state_mutability, SM::View);
+    assert_eq!(get_nonce.param_count, 2);
+    assert!(get_nonce.has_return);
+
+    let transfer = &manifest[1];
+    assert_eq!(transfer.name, "transfer");
+    assert_eq!(transfer.rust_name, "transfer");
+    assert_eq!(transfer.state_mutability, SM::NonPayable);
+    assert_eq!(transfer.param_count, 2);
+    assert!(transfer.has_return);
+
+    let pause = &manifest[2];
+    assert_eq!(pause.name, "pause");
+    assert_eq!(pause.rust_name, "pause");
+    assert_eq!(pause.state_mutability, SM::NonPayable);
+    assert_eq!(pause.param_count, 0);
+    assert!(!pause.has_return);
+
+    let deposit = &manifest[3];
+    assert_eq!(deposit.name, "deposit");
+    assert_eq!(deposit.rust_name, "deposit");
+    assert_eq!(deposit.state_mutability, SM::Payable);
+    assert_eq!(deposit.param_count, 0);
+    assert!(!deposit.has_return);
+
+    let compute = &manifest[4];
+    assert_eq!(compute.name, "compute");
+    assert_eq!(compute.rust_name, "compute");
+    assert_eq!(compute.state_mutability, SM::Pure);
+    assert_eq!(compute.param_count, 1);
+    assert!(compute.has_return);
+}
+
+#[test]
+fn abi_manifest_overloads() {
+    use alloy_sol_types::StateMutability as SM;
+
+    sol! {
+        #[sol(abi)]
+        interface IOverloaded {
+            function transfer(address to, uint256 amount) external returns (bool);
+            function transfer(address from, address to, uint256 amount) external returns (bool);
+        }
+    }
+
+    let manifest = IOverloaded::ABI_MANIFEST;
+    assert_eq!(manifest.len(), 2);
+
+    // Overloaded names get disambiguated
+    assert_eq!(manifest[0].name, "transfer");
+    assert_eq!(manifest[0].rust_name, "transfer_0");
+    assert_eq!(manifest[0].state_mutability, SM::NonPayable);
+    assert_eq!(manifest[0].param_count, 2);
+    assert!(manifest[0].has_return);
+
+    assert_eq!(manifest[1].name, "transfer");
+    assert_eq!(manifest[1].rust_name, "transfer_1");
+    assert_eq!(manifest[1].state_mutability, SM::NonPayable);
+    assert_eq!(manifest[1].param_count, 3);
+    assert!(manifest[1].has_return);
+}

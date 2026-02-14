@@ -5,7 +5,7 @@ use crate::utils::ExprArray;
 use alloy_sol_macro_input::{ContainsSolAttrs, docs_str, mk_doc};
 use ast::{Item, ItemContract, ItemError, ItemEvent, ItemFunction, SolIdent, Spanned};
 use heck::ToSnakeCase;
-use proc_macro2::{Ident, Span, TokenStream};
+use proc_macro2::{Ident, TokenStream};
 use quote::{format_ident, quote};
 use syn::{Attribute, Result, parse_quote};
 
@@ -220,7 +220,11 @@ pub(super) fn expand(cx: &mut ExpCtxt<'_>, contract: &ItemContract) -> Result<To
             let functions_map = to_abi::functions_map(&functions, cx);
             let events_map = to_abi::events_map(&events, cx);
             let errors_map = to_abi::errors_map(&errors, cx);
+            let abi_manifest = (!functions.is_empty())
+                .then(|| generate_abi_manifest(name, &functions, cx));
             quote! {
+                #abi_manifest
+
                 /// Contains [dynamic ABI definitions](alloy_sol_types::private::alloy_json_abi) for [this contract](self).
                 pub mod abi {
                     use super::*;
@@ -1098,7 +1102,7 @@ fn generate_error_builders(
     let enum_name = format_ident!("{contract_name}Errors");
     let methods = errors.iter().map(|error| {
         let variant_name = &error.name;
-        let fn_name = snakify_ident(variant_name);
+        let fn_name = format_ident!("{}", snakify(&variant_name.to_string()));
         let doc = format!("Creates a `{variant_name}` error.");
 
         match error.parameters.len() {
@@ -1132,11 +1136,30 @@ fn generate_error_builders(
                     .enumerate()
                     .map(|(i, p)| {
                         let sol_name = super::anon_name((i, p.name.as_ref()));
-                        let param_name = snakify_ident(&sol_name);
-                        (sol_name, param_name, cx.expand_rust_type(&p.ty))
+                        let param_name =
+                            format_ident!("{}", snakify(&sol_name.to_string()));
+                        let ty = cx.expand_rust_type(&p.ty);
+                        (sol_name, param_name, ty)
                     })
                     .collect();
-                builder_method(&fn_name, &doc, &variant_name, &params)
+
+                let fn_params = params.iter().map(|(_, param_name, ty)| {
+                    quote!(#param_name: #ty)
+                });
+
+                let field_inits = params.iter().map(|(sol_name, param_name, _)| {
+                    quote!(#sol_name: #param_name)
+                });
+
+                quote! {
+                    #[doc = #doc]
+                    #[inline]
+                    pub fn #fn_name(#(#fn_params),*) -> Self {
+                        Self::#variant_name(#variant_name {
+                            #(#field_inits),*
+                        })
+                    }
+                }
             }
         }
     });
@@ -1158,7 +1181,7 @@ fn generate_event_builders(
     let enum_name = format_ident!("{contract_name}Events");
     let methods = events.iter().map(|event| {
         let variant_name = cx.overloaded_name((*event).into());
-        let fn_name = snakify_ident(&variant_name);
+        let fn_name = format_ident!("{}", snakify(&variant_name.to_string()));
         let doc = format!("Creates a `{variant_name}` event.");
 
         if event.parameters.is_empty() {
@@ -1176,11 +1199,30 @@ fn generate_event_builders(
                 .enumerate()
                 .map(|(i, p)| {
                     let sol_name = super::anon_name((i, p.name.as_ref()));
-                    let param_name = snakify_ident(&sol_name);
-                    (sol_name, param_name, cx.expand_event_param_type(p))
+                    let param_name =
+                        format_ident!("{}", snakify(&sol_name.to_string()));
+                    let ty = cx.expand_event_param_type(p);
+                    (sol_name, param_name, ty)
                 })
                 .collect();
-            builder_method(&fn_name, &doc, &variant_name, &params)
+
+            let fn_params = params.iter().map(|(_, param_name, ty)| {
+                quote!(#param_name: #ty)
+            });
+
+            let field_inits = params.iter().map(|(sol_name, param_name, _)| {
+                quote!(#sol_name: #param_name)
+            });
+
+            quote! {
+                #[doc = #doc]
+                #[inline]
+                pub fn #fn_name(#(#fn_params),*) -> Self {
+                    Self::#variant_name(#variant_name {
+                        #(#field_inits),*
+                    })
+                }
+            }
         }
     });
 
@@ -1192,31 +1234,59 @@ fn generate_event_builders(
     }
 }
 
-/// Emits a single named-field builder method.
-fn builder_method(
-    fn_name: &Ident,
-    doc: &str,
-    variant_name: &SolIdent,
-    params: &[(Ident, Ident, TokenStream)],
+/// Generates `pub const ABI_MANIFEST: &[MethodSpec]` on the interface module.
+#[cfg(feature = "json")]
+fn generate_abi_manifest(
+    contract_name: &SolIdent,
+    functions: &[ItemFunction],
+    cx: &ExpCtxt<'_>,
 ) -> TokenStream {
-    let fn_params = params.iter().map(|(_, param_name, ty)| quote!(#param_name: #ty));
-    let field_inits = params.iter().map(|(sol_name, param_name, _)| quote!(#sol_name: #param_name));
+    let alloy_sol_types = &cx.crates.sol_types;
+
+    let entries = functions.iter().map(|f| {
+        let sol_name = f.name.as_ref().expect("function has no name").as_string();
+        let overloaded = cx.function_name(f);
+        let rust_name = snakify(&overloaded.as_string());
+        let selector = cx.function_selector(f);
+
+        let state_mutability = match f.attributes.mutability() {
+            Some(ast::Mutability::Pure(_) | ast::Mutability::Constant(_)) => {
+                quote!(#alloy_sol_types::StateMutability::Pure)
+            }
+            Some(ast::Mutability::View(_)) => {
+                quote!(#alloy_sol_types::StateMutability::View)
+            }
+            Some(ast::Mutability::Payable(_)) => {
+                quote!(#alloy_sol_types::StateMutability::Payable)
+            }
+            None => {
+                quote!(#alloy_sol_types::StateMutability::NonPayable)
+            }
+        };
+
+        let param_count = f.parameters.len();
+        let has_return = f.returns.as_ref().is_some_and(|r| !r.returns.is_empty());
+
+        quote! {
+            #alloy_sol_types::MethodSpec {
+                selector: #selector,
+                name: #sol_name,
+                rust_name: #rust_name,
+                state_mutability: #state_mutability,
+                param_count: #param_count,
+                has_return: #has_return,
+            }
+        }
+    });
+
+    let doc = format!("ABI method manifest for [`{contract_name}`](self).");
+
     quote! {
         #[doc = #doc]
-        #[inline]
-        pub fn #fn_name(#(#fn_params),*) -> Self {
-            Self::#variant_name(#variant_name {
-                #(#field_inits),*
-            })
-        }
+        pub const ABI_MANIFEST: &[#alloy_sol_types::MethodSpec] = &[
+            #(#entries),*
+        ];
     }
-}
-
-/// Converts a name to snake_case, falling back to a raw identifier if the
-/// result is a Rust keyword.
-fn snakify_ident(name: &impl ToString) -> Ident {
-    let s = snakify(&name.to_string());
-    syn::parse_str::<Ident>(&s).unwrap_or_else(|_| Ident::new_raw(&s, Span::call_site()))
 }
 
 /// `heck` doesn't treat numbers as new words, and discards leading underscores.

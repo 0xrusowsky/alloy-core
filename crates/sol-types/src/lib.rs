@@ -26,6 +26,9 @@ mod ext;
 #[cfg(feature = "json")]
 pub use ext::JsonAbiExt;
 
+mod abi_manifest;
+pub use abi_manifest::{MethodSpec, StateMutability};
+
 mod impl_core;
 
 mod types;
